@@ -1,0 +1,17 @@
+[package]
+name = "stm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossbeam = "0.8.5"
+parking_lot = "0.12.5"
+
+[dev-dependencies]
+criterion = "0.8.2"
+loom = "0.7.2"
+rand = "0.10.3"
+
+[[bench]]
+name = "transfer_bench"
+harness = false
