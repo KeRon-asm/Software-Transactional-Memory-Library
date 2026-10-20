@@ -62,11 +62,11 @@ cargo fmt --check
 
 ## Roadmap
 
-- [ ] `TVar<T>` and global version clock
-- [ ] Transaction context (read-set, write-set, read version)
-- [ ] `atomically` with commit and abort/retry
-- [ ] Single-threaded unit tests
-- [ ] Multi-threaded bank-transfer test (total balance invariant)
+- [x] `TVar<T>` and global version clock
+- [x] Transaction context (read-set, write-set, read version)
+- [x] `atomically` with commit and abort/retry
+- [x] Single-threaded unit tests
+- [x] Multi-threaded bank-transfer test (total balance invariant)
 - [ ] `loom` tests for the commit protocol
 - [ ] Baselines: coarse-grained lock and per-account locks
 - [ ] Benchmarks across contention levels (`criterion`)
