@@ -38,16 +38,19 @@
 //! A transaction's write-set holds writes to TVars of many different types.
 //! `Cell` is the object-safe slice of a `TVar` that the commit protocol
 //! needs (lock, validate, store, unlock), so the write-set can hold
-//! `Arc<dyn Cell>` regardless of `T`.
+//! `&dyn Cell` regardless of `T`. The id used for lock ordering is
+//! stored next to each handle in the transaction's sets, so it can be
+//! compared without a virtual call.
 
-use parking_lot::Mutex;
+use crate::sync::{self, AtomicBool, Mutex, Ordering};
 use std::any::Any;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Source of unique TVar ids. Only uniqueness matters here, so `Relaxed`
-/// is enough: no other memory is published through this counter.
-static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+/// is enough: no other memory is published through this counter. It is a
+/// plain `std` atomic even under `loom`, because it is not part of the
+/// protocol being model-checked.
+static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A transactional variable holding a value of type `T` plus a version.
 ///
@@ -93,7 +96,7 @@ impl<T> TVar<T> {
     pub fn new(value: T) -> Self {
         TVar {
             shared: Arc::new(Shared {
-                id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+                id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 commit_lock: AtomicBool::new(false),
                 cell: Mutex::new(Inner { value, version: 0 }),
             }),
@@ -121,12 +124,15 @@ impl<T> TVar<T> {
     ///
     /// The lock flag is checked *before* taking the value, and the value and
     /// version are then read together under the mutex. `ARCHITECTURE.md`
-    /// explains why that order is sufficient.
+    /// explains why that order, with acquire/release ordering, is sufficient:
+    /// the transaction learned its read version by *acquiring* the global
+    /// clock, which every committer *releases* (bumps) only after taking its
+    /// locks, so any commit our snapshot includes has a lock flag we can see.
     pub(crate) fn read_at(&self, read_version: u64) -> Option<T>
     where
         T: Clone,
     {
-        if self.shared.commit_lock.load(Ordering::SeqCst) {
+        if self.shared.commit_lock.load(Ordering::Acquire) {
             return None;
         }
         let inner = self.shared.cell.lock();
@@ -138,10 +144,11 @@ impl<T> TVar<T> {
 }
 
 impl<T: Send + 'static> TVar<T> {
-    /// A type-erased handle to this `TVar`, for storing in a transaction's
-    /// read-set or write-set regardless of `T`.
-    pub(crate) fn erased(&self) -> Arc<dyn Cell> {
-        Arc::clone(&self.shared) as Arc<dyn Cell>
+    /// A type-erased view of this `TVar`, for storing in a transaction's
+    /// read-set or write-set regardless of `T`. It borrows the `TVar`, so
+    /// no reference count is touched.
+    pub(crate) fn cell(&self) -> &dyn Cell {
+        &*self.shared
     }
 }
 
@@ -158,9 +165,6 @@ impl<T> Clone for TVar<T> {
 /// Implemented for the shared state behind every `TVar<T>`; used through
 /// `Arc<dyn Cell>` so one write-set can mix `TVar`s of different types.
 pub(crate) trait Cell: Send + Sync {
-    /// The `TVar`'s unique id (the lock-ordering key).
-    fn id(&self) -> u64;
-
     /// Acquire the commit lock, waiting if another committer holds it.
     ///
     /// Waiting cannot deadlock as long as every committer takes its locks in
@@ -186,38 +190,44 @@ pub(crate) trait Cell: Send + Sync {
 }
 
 impl<T: Send + 'static> Cell for Shared<T> {
-    fn id(&self) -> u64 {
-        self.id
-    }
-
     fn lock(&self) {
+        // AcqRel on success: acquire, so we see everything the previous
+        // holder wrote before unlocking; release, so a committer that later
+        // acquires the global clock (which we bump after locking) sees the
+        // flag set. A failed exchange publishes nothing: Relaxed. The
+        // wait loop is only a hint, so it is Relaxed too.
         let mut spins = 0u32;
         while self
             .commit_lock
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
             .is_err()
         {
             // Wait until it looks free before trying the compare-exchange
             // again, so waiters don't hammer the cache line. The critical
             // section is short (a handful of stores), so spin briefly and
             // then yield in case the holder was descheduled.
-            while self.commit_lock.load(Ordering::SeqCst) {
+            while self.commit_lock.load(Ordering::Relaxed) {
                 spins = spins.saturating_add(1);
                 if spins < 100 {
-                    std::hint::spin_loop();
+                    sync::spin_loop();
                 } else {
-                    std::thread::yield_now();
+                    sync::yield_now();
                 }
             }
         }
     }
 
     fn unlock(&self) {
-        self.commit_lock.store(false, Ordering::SeqCst);
+        // Release, as for any lock. (Readers would stay correct even with
+        // Relaxed here, because they read the value and version under the
+        // cell mutex, which orders them after our `store`; loom confirms a
+        // Relaxed unlock passes. Release keeps the flag a correct lock on
+        // its own instead of relying on that.)
+        self.commit_lock.store(false, Ordering::Release);
     }
 
     fn validate(&self, read_version: u64, locked_by_us: bool) -> bool {
-        if !locked_by_us && self.commit_lock.load(Ordering::SeqCst) {
+        if !locked_by_us && self.commit_lock.load(Ordering::Acquire) {
             return false;
         }
         self.cell.lock().version <= read_version
@@ -236,7 +246,7 @@ impl<T: Send + 'static> Cell for Shared<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
     #[test]
@@ -253,9 +263,9 @@ mod tests {
         let b = a.clone();
         assert_eq!(a.id(), b.id());
 
-        a.erased().lock();
-        a.erased().store(Box::new(String::from("after")), 1);
-        a.erased().unlock();
+        a.cell().lock();
+        a.cell().store(Box::new(String::from("after")), 1);
+        a.cell().unlock();
 
         // Written through `a`, visible through `b`.
         assert_eq!(b.read_at(1), Some(String::from("after")));
@@ -271,7 +281,7 @@ mod tests {
     #[test]
     fn read_at_rejects_values_newer_than_the_snapshot() {
         let var = TVar::new(1);
-        let cell = var.erased();
+        let cell = var.cell();
         cell.lock();
         cell.store(Box::new(2), 5);
         cell.unlock();
@@ -284,7 +294,7 @@ mod tests {
     #[test]
     fn read_at_rejects_a_tvar_locked_by_a_committer() {
         let var = TVar::new(1);
-        let cell = var.erased();
+        let cell = var.cell();
 
         cell.lock();
         assert_eq!(var.read_at(u64::MAX), None);
@@ -295,7 +305,7 @@ mod tests {
     #[test]
     fn validate_checks_version_and_foreign_locks() {
         let var = TVar::new(1);
-        let cell = var.erased();
+        let cell = var.cell();
         cell.lock();
         cell.store(Box::new(2), 5);
         cell.unlock();
@@ -320,13 +330,12 @@ mod tests {
         const ROUNDS: usize = 5_000;
 
         let var = TVar::new(());
-        let inside = Arc::new(AtomicUsize::new(0));
+        let inside = AtomicUsize::new(0);
 
-        let handles: Vec<_> = (0..THREADS)
-            .map(|_| {
-                let cell = var.erased();
-                let inside = Arc::clone(&inside);
-                thread::spawn(move || {
+        thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    let cell = var.cell();
                     for _ in 0..ROUNDS {
                         cell.lock();
                         // If the lock works, nobody else is in here.
@@ -335,12 +344,8 @@ mod tests {
                         inside.fetch_sub(1, Ordering::SeqCst);
                         cell.unlock();
                     }
-                })
-            })
-            .collect();
-
-        for handle in handles {
-            handle.join().unwrap();
-        }
+                });
+            }
+        });
     }
 }

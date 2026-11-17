@@ -1,282 +1,178 @@
 # Architecture
 
-Design-decision notes for the STM library, which implements the TL2 algorithm
-(Dice, Shalev & Shavit, "Transactional Locking II"). This document is graded as
-evidence of understanding (interim report's "challenges encountered," final
-report's "description of work completed") and must get into the interim-report
-PDF.
-
-> **Note for the author:** these notes record the reasoning behind the
-> implementation as it currently stands. Read each section against the code and
-> rewrite anything in your own words before you submit; you should be able to
-> defend every decision below in a viva.
+Design notes for `stm`, an implementation of the TL2 algorithm (Dice, Shalev and Shavit, *Transactional Locking II*, DISC 2006). This file records what was built, why each decision was made, how correctness was argued and tested, and what the measurements showed.
 
 ## Overview
 
 ```
 atomically(|tx| { ... })
    │
-   ├─ run loop (transaction.rs)          retries until a commit succeeds
+   ├─ run loop (transaction.rs)          retry until commit, with exponential backoff
    │    ├─ Transaction::new()            rv = clock::read_clock()
-   │    ├─ body(&mut tx)                 tx.read / tx.write
+   │    ├─ body(&mut tx)                 tx.read (validated immediately) / tx.write (buffered)
    │    └─ tx.commit()                   lock → bump clock → validate → write back → unlock
    │
-   ├─ TVar<T>  (tvar.rs)                 value + version under a Mutex, plus a commit lock flag
-   └─ Clock    (clock.rs)                one global AtomicU64
+   ├─ TVar<T>   (tvar.rs)                value + version under a mutex, plus a commit-lock flag
+   ├─ Clock     (clock.rs)               one global AtomicU64
+   ├─ stats     (stats.rs)               thread-local outcome counters
+   └─ sync      (sync.rs)                std / parking_lot, or loom under --cfg loom
 ```
 
-## Resolved design questions
+## The commit protocol
 
-### `TVar<T>` internal locking
+1. **Lock** the write-set in ascending `TVar` id order.
+2. **Bump** the global clock. The new value is the write version `wv`.
+3. **Validate** each read-set entry: its version is still `<= rv` and no other committer holds its lock. Skipped when `wv == rv + 1`.
+4. **Write back** every buffered value stamped with `wv`, then **unlock**.
 
-**Chosen:** one `parking_lot::Mutex<Inner<T>>` holding `value` and `version`
-together, **plus** a separate `commit_lock: AtomicBool`.
+**Why bump after locking and before validating.** Locking first means any transaction that later learns `wv` from the clock also sees our locks (see *Memory ordering*), so it cannot read a value we are about to overwrite. Bumping before validating means any transaction that commits a write to something we read, after our validation, must have bumped the clock after us, so it gets a larger write version and serializes after us. The same fact justifies the shortcut in step 3: if the clock moved only by our own bump, no other writer committed in between.
 
-*Why the value and version share one mutex.* The alternative was a separate
-`AtomicU64` version next to a `Mutex<T>`. That lets a reader see a version and a
-value from two different moments: it reads version 5, a writer then installs
-value B at version 9, and the reader reads value B. The reader now believes it
-holds "the value as of version 5" and passes the `version <= rv` check while
-actually holding a value from the future, which silently breaks the consistent
-snapshot the whole algorithm depends on. A seqlock-style double read of the
-version could repair this, but it is subtle to get right. Putting both under one
-mutex makes the pair impossible to tear, and the mutex is only ever held for a
-clone or a swap, so contention on it is negligible.
+`tests/loom.rs` checks this ordering directly. Moving the bump before the lock (mutation M4 below) fails every loom test.
 
-*Why there is also a separate `commit_lock` flag.* A committing transaction has
-to hold locks on `TVar`s of many different `T` across several protocol steps
-(lock, bump, validate, write back). A `MutexGuard<'_, Inner<T>>` is typed by `T`
-and borrows from its `TVar`, so it can't be stored in one heterogeneous
-collection and carried through those steps. A plain flag can be set and cleared
-through a type-erased interface (see "Type erasure" below). Readers never block
-on the flag: they check it, and if it is set the transaction aborts and retries.
+**Read-only transactions** skip the commit entirely. Each read was already checked against `rv` when it happened, so together the reads form a consistent snapshot. No locks and no clock bump, so readers never slow writers down.
 
-*Cost.* Every read takes the mutex briefly, and validation takes it to read the
-version. A cheaper design would mirror the version in an `AtomicU64` for
-validation only. Not done yet; noted as a possible optimisation.
+## Reads are validated immediately (opacity)
 
-### Transaction identity for lock ordering
+`Transaction::read` returns `Err(Conflict)` if the `TVar` is locked by a committer or its version is newer than `rv`. Validating only at commit would let a body run on a mix of old and new values (one account debited, the other not yet credited) and possibly divide by zero or loop forever on a state that never existed. Aborting at read time means a body only ever computes on a consistent snapshot, which is the property Guerraoui and Kapalka call *opacity*.
 
-**Chosen:** a unique `id: u64` assigned in `TVar::new` from a global
-`AtomicU64` counter. All clones of a `TVar` share the same `Arc`, so they share
-one id.
+## `TVar<T>` internals
 
-The write-set is a `BTreeMap<u64, WriteEntry>` keyed by that id, so iterating it
-yields the entries in ascending id order. That iteration order **is** the fixed
-global lock order. If every committer acquires locks in ascending id order, no
-cycle of "A waits for B, B waits for A" can form, so commits cannot deadlock.
-`LockedSet::acquire` has a `debug_assert!` that the order really is strictly
-ascending.
+**One mutex holds the value and the version together.** The alternative, a separate `AtomicU64` version beside a `Mutex<T>`, lets a reader read version 5, have a writer install a value at version 9, then read that value, and believe it holds "the value as of version 5". Putting both under one mutex makes the pair impossible to tear. The mutex is held only for a clone or a swap.
 
-An id was chosen over the heap address of the `Arc` because it makes the
-ordering explicit and independent of allocator behaviour. (The address would
-also be stable while the `TVar` is alive, so it would have worked.)
+**A separate `commit_lock: AtomicBool`.** A committer must hold locks on `TVar`s of several different `T` across several protocol steps. A `MutexGuard<'_, Inner<T>>` is typed by `T`, so it cannot live in one heterogeneous collection. A flag can be set and cleared through a type-erased interface. Readers never block on it; they abort and retry.
 
-### Memory ordering
+**Type erasure.** A `pub(crate)` trait `Cell { lock, unlock, validate, store }` is implemented for every `TVar`'s shared state. The transaction's sets hold `&dyn Cell`, and pending values are `Box<dyn Any + Send>`, downcast back to `T` in `store`. The downcast cannot fail, because each entry is created from a typed `TVar<T>` together with a value of type `T`.
 
-**Chosen:** `Ordering::SeqCst` for the clock and for every operation on the
-commit-lock flag. `Relaxed` only for the id counter, which just needs
-uniqueness and publishes no other memory.
+**Ids for lock ordering.** Each `TVar` gets a unique `u64` id from a global counter when it is created; clones share it. Committers lock in ascending id order, so no cycle of "A waits for B waits for A" can form. An id was chosen over the heap address so the order is explicit.
 
-*Why not weaker.* The correctness argument needs a single total order across two
-different atomics (the clock and the lock flag). Consider a committer C that
-will write at version `wv`, and a reader R that starts with snapshot `rv >= wv`:
+**Initial version is 0**, which is never above any read version, so a fresh `TVar` is readable by every transaction.
 
-1. C sets its lock flag, *then* bumps the clock to `wv`.
-2. R reads the clock (sees `rv >= wv`), *then* checks C's lock flag.
+## Transaction representation
 
-In the `SeqCst` total order, C's lock precedes C's bump, which precedes R's
-clock read, which precedes R's flag check. So R's flag check must see C's lock
-or something later: either the flag is still set (R aborts, correct, because the
-value R would read is stale), or C has already unlocked, in which case C's write
-happened-before the unlock and R's snapshot sees it. Either way R can never
-silently read a pre-`wv` value while holding a snapshot that should include `wv`.
-This is a store-then-load pattern across two locations, which acquire/release
-ordering alone does **not** guarantee, so weakening it would need real
-justification (and `loom` coverage; see Known gaps).
+**Borrowed references, not reference counts.** `Transaction<'env>` holds `&'env dyn Cell` references to the `TVar`s it touched, and `read`/`write` take `&'env TVar<T>`. The first version cloned an `Arc` per read and per write. Every clone and drop is an atomic read-modify-write on a cache line that all threads share, so this was a real source of contention. With references, recording a read costs no atomic operation, and the borrow checker guarantees every `TVar` outlives the transactions that point at it. A body that creates a `TVar` and reads it is now a compile error (there is a `compile_fail` doctest for this). For ordinary closures the API is unchanged. A helper function that takes a transaction must name the shared lifetime: `fn f<'env>(tx: &mut Transaction<'env>, v: &'env TVar<i64>)`.
 
-### The commit protocol (and why the clock is bumped before validation)
+**Inline small vectors, not maps.** The read-set is a `SmallVec` of `(id, &dyn Cell)` with 8 inline slots. The write-set is a `SmallVec` of `(id, &dyn Cell, boxed value)` with 4 inline slots, with at most one entry per `TVar`. It is sorted by id once, at commit, which gives the lock order; `binary_search` then answers "is this read also one of my writes?" during validation. The first version used a `HashMap` and a `BTreeMap`, which cost two heap allocations per transaction. Typical transactions are small, so a linear scan for read-your-own-writes beats hashing. A transaction that writes thousands of `TVar`s would want a map; that is a known trade-off.
 
-1. **Lock** the write-set in ascending id order.
-2. **Bump** the global clock: the new value is the write version `wv`.
-3. **Validate** each read-set entry: `version <= rv` and not locked by another
-   committer. (Skipped if `wv == rv + 1`.)
-4. **Write back** every value stamped with `wv`, then **unlock**.
+**Duplicate reads.** Reading the same `TVar` twice adds two read-set entries. That costs one redundant validation and saves a lookup on every read.
 
-The bump comes after the locks and before validation so that any transaction
-that later writes something we validated is guaranteed a larger write version
-than ours, i.e. it serialises *after* us. If it had bumped first, it could
-serialise before us while we validate against pre-commit state. The same fact
-justifies the `wv == rv + 1` shortcut: if the clock moved by exactly our own
-bump, no other writer committed in between, so none of our reads can have been
-invalidated.
+**`LockedSet`** owns the sorted write-set while it is locked and unlocks every locked entry when dropped, so an early `return false` from validation, or a panic, can never leave a `TVar` locked.
 
-A transaction with an empty write-set skips the whole commit: every read was
-already checked against `rv` at the moment it happened, so the reads form a
-consistent snapshot. No locks, no clock bump, so read-only transactions never
-slow writers down.
+## Memory ordering
 
-### Reads are checked immediately (opacity), not just at commit
+The clock is read with `Acquire` and bumped with an `AcqRel` `fetch_add`. The commit-lock flag is taken with an `AcqRel` compare-exchange, released with a `Release` store, and checked by readers and validators with `Acquire` loads.
 
-`Transaction::read` returns `Err(Conflict)` if the `TVar` is locked by a
-committer or its version is newer than `rv`. Validating only at commit would let
-a closure run to completion on a mix of old and new values (for example, see one
-account debited but not yet the other credited) and could divide by zero or
-panic on state that never existed. Aborting at read time means a closure only
-ever computes on a consistent snapshot.
+**The argument.** Take a committer C that will write at version `wv`, and a reader R whose snapshot `rv >= wv` includes C's commit.
 
-### How the closure reports "retry me" vs "my logic failed"
+1. C sets its lock flags (compare-exchange), *then* bumps the clock (release).
+2. R reads the clock (acquire) and gets `wv` or a later value. If later, the value was written by some other committer's `fetch_add`. Every bump is a read-modify-write, so it continues C's *release sequence*, and R still synchronizes with C.
+3. So C's lock acquisitions *happen before* R's flag check. R sees the flag set (and aborts) or sees a later state, in which case C has written back, and R reads C's value and version through the cell mutex.
 
-Closures return `Result`, so `?` works naturally.
+So R can never read a pre-`wv` value while holding a snapshot that includes `wv`. Validation is covered by the same reasoning: two committers' clock bumps are totally ordered, and the later one acquires the earlier one's locks.
 
-* `atomically` takes `Fn(&mut Transaction) -> Result<T, Conflict>` and returns
-  `T`. The only error is `Conflict`, produced by `tx.read(..)?`, which means
-  "retry".
-* `try_atomically` takes `Fn(&mut Transaction) -> Result<T, TxError<E>>` and
-  returns `Result<T, E>`. `TxError::Conflict` retries; `TxError::Failed(e)`
-  discards the buffered writes and returns `Err(e)` without retrying. A
-  `From<Conflict> for TxError<E>` impl lets `?` on reads work in both.
+**A correction.** The first version used `SeqCst` everywhere, and this document claimed acquire/release was *insufficient* because the pattern was "a store followed by a load on a different location". That was wrong. It is a message-passing pattern carried by the clock: the reader learns about the commit *through* the clock value it acquires. Loom (which models acquire/release precisely and treats `SeqCst` the same way) passes every scenario with the weaker orderings, and fails them all if the clock is made `Relaxed` (mutation M3), which shows the clock's ordering is the one carrying the argument.
 
-A `Failed` result can be trusted because every read that led to it was already
-validated against the snapshot.
+**The unlock store** is `Release`, as any lock's should be. Loom also passes with a `Relaxed` unlock (mutation M5). That is expected: readers read the value and version under the cell mutex, and the mutex orders them after the committer's write-back. `Release` is kept so the flag is a correct lock on its own rather than depending on that.
 
-### Retry strategy
+## Retry and backoff
 
-A plain `loop` in `run()`. Each attempt takes a fresh snapshot. A transaction
-only retries because another transaction committed (or is committing) a write it
-depends on, so the system as a whole always makes progress, but an individual
-transaction can starve under sustained contention.
+`run()` loops until a commit succeeds. Between attempts it backs off: after the k-th consecutive failure it spins for about `2^k` pause instructions (k capped at 6), then yields the thread.
 
-There is **no backoff** yet (deferred checklist item). No livelock was observed
-in the tests, including 8 threads hammering 2 accounts (see Evidence), but a
-real backoff policy is still needed before claiming robustness under load.
+**Measured effect.** Backoff made no difference to the original implementation, but once transactions became cheap it became essential. Without it, 100 threads on 2 accounts collapse to 0.04 M commits/s with 99.98% of attempts retried, which is effectively livelock. With it, the same run sustains 1.6 M/s with about 43% retried. The original code's heap allocations had been acting as accidental backoff. In the criterion benchmark, removing backoff from the final version cuts throughput from 2.81 to 0.74 M/s at 2 accounts.
 
-### Type erasure of the read/write sets
+**Progress.** A transaction only retries because another transaction committed or is committing a write it depends on, so the system as a whole always makes progress. An individual transaction can still starve under sustained contention; there is no fairness mechanism.
 
-A write-set mixes `TVar<i32>`, `TVar<String>`, and so on. The commit protocol
-only needs type-independent operations, so `tvar.rs` defines a `pub(crate)`
-trait `Cell { id, lock, unlock, validate, store }` implemented for each
-`TVar`'s shared state, and the sets hold `Arc<dyn Cell>`. Pending values are
-stored as `Box<dyn Any + Send>` and downcast back to `T` inside `store`; the
-downcast cannot fail because each write-set entry is created from a typed
-`TVar<T>` and `T` together.
+## Instrumentation
 
-Consequences for the public API: `read` needs `T: Clone + Send + 'static`
-(values are cloned out of the cell) and `write` needs `T: Send + 'static`.
+`stats.rs` keeps four counters per thread: commits, read conflicts, validation failures, and user aborts. They are thread-local on purpose. A single global counter would be one more cache line that every committing thread writes. The live dashboard reads each worker's `thread_stats()` and publishes it to a cache-line-aligned slot.
 
-### Other decisions
+With `--features trace`, every attempt is logged to stderr with its thread, attempt number, read version, set sizes, and outcome. The feature compiles to nothing when it is off.
 
-* **Initial version of a new `TVar` is 0.** A transaction's `rv` is a clock
-  reading, never below 0, so a fresh `TVar` always passes `version <= rv`.
-* **`Clock` struct instead of a bare `static`.** The library uses one global
-  instance, but unit tests create private ones. The original test asserted exact
-  values on the shared static, which would be flaky as soon as another test
-  committed a transaction in parallel.
-* **`parking_lot::Mutex`** rather than `std::sync::Mutex`: no lock poisoning
-  (nothing to unwrap) and slightly faster uncontended.
-* **Panics.** A panic in a user closure cannot leave anything locked, because
-  locks are only held during `commit`, and `LockedSet` releases them on drop.
-* **Lock acquisition spins, then yields.** Committers wait for each other with a
-  short spin followed by `yield_now`. The original TL2 paper instead *tries* the
-  lock and aborts on failure. Ordered blocking acquisition was chosen to match
-  the project checklist; try-lock-and-abort is a possible alternative.
+## Errors versus retry
 
-## Deviations from the scaffold
+Closures return `Result`, so `?` works.
 
-| Scaffold | Implementation | Reason |
-|---|---|---|
-| `TVar { inner: Arc<Mutex<Inner<T>>> }` | `TVar { shared: Arc<Shared<T>> }` with `id`, `commit_lock`, `cell: Mutex<Inner<T>>` | Needs a lock that outlives a single call and an id for ordering |
-| `std::sync::Mutex` | `parking_lot::Mutex` | No poisoning; already a dependency |
-| `static GLOBAL_CLOCK: AtomicU64` | `static GLOBAL_CLOCK: Clock` wrapping an `AtomicU64` | Testable in isolation |
-| `atomically(F: Fn(&mut Transaction) -> T) -> T` | closure returns `Result<T, Conflict>` | `read` must be able to abort mid-closure without panicking |
-| Read-set of `(TVar, recorded version)` | Read-set of `TVar` handles keyed by id | Each read already enforced `version <= rv`; commit re-checks the same bound |
-| (not in scaffold) | `try_atomically`, `TxError`, `Conflict` | Answers the "retry vs failure" design question |
+- `atomically` takes `Fn(&mut Transaction) -> Result<T, Conflict>` and returns `T`. The only error is `Conflict`, produced by `tx.read(..)?`, which means "retry".
+- `try_atomically` takes `Fn(&mut Transaction) -> Result<T, TxError<E>>` and returns `Result<T, E>`. `TxError::Conflict` retries; `TxError::Failed(e)` discards the buffered writes and returns `Err(e)` without retrying. A `From<Conflict>` impl lets `?` on reads work in both.
 
-## Challenges encountered
+A `Failed` result can be trusted because every read that led to it was validated against the snapshot.
 
-* **Stale reads while a commit is in flight.** A reader whose snapshot already
-  includes a commit can still see the *old* value if the committer has locked
-  but not yet written. Fixed by having readers refuse any locked `TVar`, with the
-  `SeqCst` ordering argument above.
-* **Heterogeneous write-set.** A single collection of writes to `TVar`s of
-  different types, held locked across several steps, doesn't fit a typed
-  `MutexGuard`. Solved with the `Cell` trait object plus a flag-based commit
-  lock.
-* **Deadlock-free locking.** Two committers writing the same pair of `TVar`s in
-  opposite orders would deadlock; solved by ordering the write-set by id.
-* **Testing a global.** The clock test in the scaffold would be unreliable
-  under parallel test execution; solved by splitting out the `Clock` type.
-* **Demonstrating the naive failure in safe Rust.** Safe Rust won't compile a
-  genuine unsynchronised data race on an `i64`. The naive comparison uses
-  atomic loads and stores with a non-atomic read-modify-write, which is a
-  *logic* race (lost updates), not undefined behaviour. A `yield_now` between
-  the load and the store makes the lost updates show up reliably.
+## How the tests were tested
+
+**The loom setup.** `src/sync.rs` re-exports `std` atomics and `parking_lot::Mutex` normally, and `loom`'s instrumented versions under `--cfg loom`. Spin and yield hints become `loom::thread::yield_now()` so loom can schedule around busy-waits. The global clock becomes a `loom::lazy_static!` so every execution starts fresh. The loom tests therefore exercise the real library code, not a copy of it.
+
+**Scenarios** (two threads each): opposite-direction transfers (deadlock and lost updates), a reader concurrent with a transfer (partial-state reads), concurrent increments (lost updates), and write skew (serializability). At preemption bound 4 they explore 518, 3,029, 624 and 1,135 interleavings.
+
+**Mutation testing.** To confirm the suite can fail, bugs were planted one at a time:
+
+| Mutation | Loom result |
+|---|---|
+| M1: skip read-set validation | 3 of 4 tests fail |
+| M2: readers ignore the commit lock | 4 of 4 fail |
+| M3: clock operations `Relaxed` | 4 of 4 fail |
+| M4: bump the clock before locking | 4 of 4 fail |
+| M5: commit-lock release `Relaxed` | all pass (expected, see *Memory ordering*) |
+
+**A trap found along the way.** Loom's unbounded mode looked like the stronger option and finished faster, but it explored only 22 executions of the reader scenario and missed M2, which bounds 2, 3 and 4 all catch. The suite therefore uses a bound of 4 by default (override with `STM_LOOM_PREEMPTIONS`).
+
+**The naive comparison** in `tests/bank_transfer.rs` performs the same transfers with atomic loads and stores but a non-atomic read-modify-write. Safe Rust will not compile a true data race on an `i64`, so this is a *logic* race (lost updates), not undefined behaviour. A `yield_now` between the load and the store makes it fail reliably.
 
 ## Evidence
 
-Everything below was measured on a 2-core Linux sandbox; treat the numbers as
-indicative, not definitive.
+All measurements are from a 2-core Linux machine; treat them as relative.
 
-**Correctness tests** (`cargo test`): 20 unit tests, 3 doctests, 3 integration
-tests, all passing. The suite was repeated 25 times in release mode and 15 times
-in debug mode with no failures.
+**Tests:** 35 from `cargo test` (27 unit, 3 integration, 5 doc, including one `compile_fail`) and 4 loom scenarios, all passing.
 
-**Bank-transfer invariant** (`tests/bank_transfer.rs`): 8 threads × 10,000
-random transfers. Checked three ways: the final total equals the starting total,
-no balance goes negative (overdrafts are rejected with `try_atomically`), and an
-auditor thread summing all accounts inside a transaction *while the transfers
-run* never sees a total other than the starting one. Run at 8 accounts and at 2
-accounts (maximum contention). A typical run: 72,909 transfers completed, 7,091
-rejected for insufficient funds, 5,941 audits all passing (8 accounts); 75,957
-completed, 4,043 rejected, 38,789 audits passing (2 accounts).
+**Throughput** (criterion, 4 threads x 5,000 transfers per iteration, 20 samples, 5 s measurement; million transfers per second):
 
-**Naive comparison:** the same transfers with plain load/store and no
-transaction: in one run the total drifted from the starting total by +27,804.
-The exact drift varies per run; the test requires only that it be non-zero in at
-least one of up to five attempts.
-
-**Throughput** (`cargo bench`, short run: 4 threads × 5,000 transfers, 10
-samples, 1 s measurement; transfers/second):
-
-| Accounts | STM | Coarse lock | Fine-grained locks |
+| Accounts | STM | Coarse lock | Per-account locks |
 |---|---|---|---|
-| 2 (high contention) | ~0.74 M/s | ~29 M/s | ~17 M/s |
-| 8 | ~1.4 M/s | ~28 M/s | ~9.8 M/s |
-| 64 (low contention) | ~1.9 M/s | ~30 M/s | ~17 M/s |
+| 2 (high contention) | 2.81 | 30.29 | 18.52 |
+| 8 | 2.80 | 32.49 | 9.16 |
+| 64 (low contention) | 4.68 | 27.52 | 15.48 |
 
-Reading these honestly: the STM is roughly 15–40× *slower* than either lock
-version on this workload, and the benchmark should say so. Each transfer does two
-integer additions, so a mutex costs almost nothing, while every STM transaction
-pays for building a read-set and write-set (a `HashMap`, a `BTreeMap`, boxed
-values, `Arc` clones) and taking a mutex per read. STM's throughput does improve
-as contention drops (2 → 64 accounts), which matches expectations, but it does
-not catch the locks here. Fine-grained locks being slower than the single
-coarse lock on 2 cores with 4 threads was not investigated. The case for STM is
-composability and freedom from lock-ordering bugs, not raw speed on tiny
-critical sections. A fair comparison would also need larger transactions and a
-machine with more cores; profiling and cheaper set representations (for
-example a small inline vector instead of maps for short transactions) are the
-obvious next steps.
+**Optimization ablation** (same settings, STM only):
 
-## Known gaps (update as phases complete)
+| Version | 2 | 8 | 64 |
+|---|---|---|---|
+| Original | 0.38 | 1.05 | 2.10 |
+| + backoff | 0.45 | 1.02 | 2.01 |
+| + inline sets | 1.46 | 2.08 | 3.56 |
+| + borrowed references (final) | 2.81 | 2.80 | 4.68 |
+| final without backoff | 0.74 | 1.02 | 2.69 |
 
-- No backoff policy yet (Phase 3 checklist item, deferred).
-- No `loom` coverage yet (Phase 4). The `loom` dev-dependency is present but
-  unused: using it means swapping in `loom`'s atomics and mutex under
-  `cfg(loom)`. It is the right tool for checking the memory-ordering argument
-  above and for trying weaker orderings.
-- Memory ordering is `SeqCst` throughout; not yet relaxed or justified
-  piece by piece.
-- No blocking `retry` / `or_else` combinators (waiting until a condition on
-  some `TVar` becomes true).
-- Values are cloned on every read (`T: Clone`); large values would be better
-  held behind an `Arc`.
-- Per-transaction allocation overhead (see the throughput table).
-- Nested `atomically` calls inside a closure run as separate, independent
-  transactions; they are not composed into the outer one.
-- No distributed extension yet (see `ROADMAP.md`, written in Phase 7).
+**Reading these honestly.** STM is 6 to 12 times slower than one coarse lock and 3 to 7 times slower than per-account locks on this workload. Each transfer is two integer additions, so a mutex costs almost nothing, while every transaction still pays for a snapshot, a boxed value per write, a mutex acquisition per read, a contended clock bump per commit, and validation. The case for STM is composability and the absence of lock-ordering bugs. In `examples/deadlock_demo.rs`, where the critical section yields while holding its locks, STM finished in 300 to 400 ms against 600 to 650 ms for correctly ordered locks in 5 of 5 runs (timings have 50 ms resolution), because an STM transaction holds no lock while it waits. Per-account locks being slower than one coarse lock at every contention level was not investigated in depth; with only 2 cores, there is little parallelism for fine-grained locking to exploit.
 
-## References
+**Live demo:** 100 threads on 2 accounts for 6 s gave 9.4 M commits, 43.7% of attempts retried, and 1,014,630 concurrent audits with 0 violations.
 
-- Dice, Shalev, Shavit. *Transactional Locking II.* DISC 2006. (The TL2
-  algorithm implemented here.)
+## Challenges encountered
+
+- **Stale reads during an in-flight commit.** A reader whose snapshot includes a commit could see the old value if the committer had locked but not yet written. Fixed by having readers refuse any locked `TVar`, justified by the ordering argument above and checked by loom (M2).
+- **A heterogeneous write-set held across several steps.** It does not fit a typed `MutexGuard`. Solved with the `Cell` trait object and a flag-based commit lock.
+- **Deadlock-free commits.** Solved by locking in ascending id order, demonstrated by the deadlock demo and the opposite-transfer loom test.
+- **Getting the memory-ordering argument right.** The first written argument was wrong (see *A correction*). Model checking plus mutation testing turned it from an assertion into something checked.
+- **Livelock after optimizing.** Making transactions cheaper exposed a near-livelock that the slower code had hidden. Fixed with exponential backoff.
+- **Trusting the test tool.** Loom's unbounded mode silently explored less. Planting known bugs is what revealed it.
+- **Testing a global.** The scaffold's clock test asserted exact values on the shared static, which is flaky under parallel tests. Fixed by splitting out a `Clock` type that tests can create privately.
+
+## Known limitations
+
+- **No blocking `retry` / `or_else`** (waiting until some `TVar` changes, as in Haskell's STM).
+- **Nested `atomically` calls** inside a body run as separate transactions; they are not flattened into the outer one.
+- **Values are cloned on every read** (`T: Clone`). Large values should be stored behind an `Arc`.
+- **Each write boxes its value**, which is one heap allocation per write.
+- **The global clock is one contended cache line.** TL2's GV4/GV5 clock variants reduce this.
+- **No fairness or contention manager**, so an individual transaction can starve.
+- **Loom coverage is bounded** (two threads, preemption bound 4). It is systematic, not a proof for all schedules.
+- **No distributed extension yet.** See `ROADMAP.md`.
+
+## Deviations from the original scaffold
+
+| Scaffold | Implementation | Reason |
+|---|---|---|
+| `TVar { inner: Arc<Mutex<Inner<T>>> }` | `TVar { shared: Arc<Shared<T>> }` with `id`, `commit_lock`, `cell` | A lock that outlives one call, and an id for ordering |
+| `std::sync::Mutex` | `parking_lot::Mutex` (loom's under `--cfg loom`) | No poisoning; swappable for model checking |
+| `static GLOBAL_CLOCK: AtomicU64` | `Clock` type wrapping an `AtomicU64` | Testable in isolation |
+| `atomically(F: Fn(&mut Transaction) -> T) -> T` | Body returns `Result<T, Conflict>` | Reads must be able to abort mid-body |
+| Read-set of `(TVar, version)` | `(id, &dyn Cell)`, no stored version | Each read already enforced `version <= rv` |
+| `SeqCst` (first implementation) | Acquire/release | Sufficient by the argument above; checked by loom |
+| (not in scaffold) | `try_atomically`, `TxError`, `Conflict`, `stats`, `trace` | Retry-versus-failure, instrumentation |

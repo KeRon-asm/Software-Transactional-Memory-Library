@@ -11,12 +11,17 @@
 //! clock and assert exact values without being disturbed by other tests that
 //! commit transactions (and therefore bump the global clock) in parallel.
 //!
-//! Every operation uses `Ordering::SeqCst`. The commit protocol relies on a
-//! single total order over clock bumps, TVar lock acquisitions and the
-//! "is this TVar locked?" checks done by readers; see `ARCHITECTURE.md` for
-//! the argument and for what could be relaxed later.
+//! Memory ordering: [`Clock::bump`] is an `AcqRel` read-modify-write and
+//! [`Clock::read`] an `Acquire` load. A committer bumps the clock only after
+//! it has locked its write-set, so any transaction whose read version
+//! includes that bump has *acquired* the committer's lock acquisition and is
+//! guaranteed to see the lock flags set (or the values already written).
+//! Because every bump is a read-modify-write, a later bump by another thread
+//! continues the release sequence, so reading any later clock value gives the
+//! same guarantee. `ARCHITECTURE.md` has the full argument; `tests/loom.rs`
+//! checks it under every interleaving loom explores.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::{AtomicU64, Ordering};
 
 /// A monotonically increasing version counter.
 ///
@@ -31,7 +36,17 @@ impl Clock {
     /// Create a clock starting at version 0.
     ///
     /// This is a `const fn` so a `Clock` can be used as a `static`.
+    #[cfg(not(loom))]
     pub const fn new() -> Self {
+        Clock {
+            counter: AtomicU64::new(0),
+        }
+    }
+
+    /// Create a clock starting at version 0. (`loom`'s atomics cannot be
+    /// built in a `const` context, so the loom build gets a plain `fn`.)
+    #[cfg(loom)]
+    pub fn new() -> Self {
         Clock {
             counter: AtomicU64::new(0),
         }
@@ -39,7 +54,7 @@ impl Clock {
 
     /// Read the current version without modifying it.
     pub fn read(&self) -> u64 {
-        self.counter.load(Ordering::SeqCst)
+        self.counter.load(Ordering::Acquire)
     }
 
     /// Atomically add one and return the NEW value.
@@ -49,7 +64,7 @@ impl Clock {
     /// a single atomic read-modify-write, no two callers ever get the same
     /// number back.
     pub fn bump(&self) -> u64 {
-        self.counter.fetch_add(1, Ordering::SeqCst) + 1
+        self.counter.fetch_add(1, Ordering::AcqRel) + 1
     }
 }
 
@@ -60,7 +75,15 @@ impl Default for Clock {
 }
 
 /// The global version clock, shared by all transactions.
+#[cfg(not(loom))]
 static GLOBAL_CLOCK: Clock = Clock::new();
+
+// Under loom, every model execution must start from a fresh clock, which
+// `loom::lazy_static!` provides.
+#[cfg(loom)]
+loom::lazy_static! {
+    static ref GLOBAL_CLOCK: Clock = Clock::new();
+}
 
 /// Read the current value of the global clock without modifying it.
 ///

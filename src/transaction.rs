@@ -12,13 +12,13 @@
 //!    The read itself is checked against the snapshot: if the `TVar` was
 //!    written after `rv` (or is mid-commit), the transaction aborts on the
 //!    spot instead of continuing with inconsistent data. Every `TVar` it
-//!    writes goes into a write-set (buffered — NOT applied to the real
+//!    writes goes into a write-set (buffered, NOT applied to the real
 //!    `TVar` yet).
 //! 3. At commit (read-only transactions skip this: their reads were
 //!    already validated one by one as they happened):
-//!    - **Lock** every `TVar` in the write-set, in ascending id order — a
-//!      FIXED GLOBAL ORDER, which prevents deadlock between two
-//!      transactions committing at the same time.
+//!    - **Lock** every `TVar` in the write-set, in ascending id order. This
+//!      FIXED GLOBAL ORDER prevents deadlock between two transactions
+//!      committing at the same time.
 //!    - **Bump** the global clock; the new value is the write version `wv`.
 //!    - **Validate** the read-set: every `TVar` read must still have
 //!      `version <= rv` and must not be locked by a different committer.
@@ -28,31 +28,36 @@
 //!
 //! # Design decisions (details and reasoning in `ARCHITECTURE.md`)
 //!
-//! * **Read-set**: ids of the `TVar`s read, each with a type-erased handle.
+//! * **Read-set**: a small inline vector of `(id, type-erased handle)`.
 //!   No per-entry version is stored: each read already enforced
 //!   `version <= rv`, so commit-time validation re-checks that same bound.
-//! * **Write-set**: a `BTreeMap` from `TVar` id to `(type-erased handle,
-//!   boxed pending value)`. The map is keyed by id, so iterating it yields
-//!   exactly the global lock order, and a transaction's own writes can be
-//!   found again (read-your-writes) in `O(log n)`.
+//!   Reading the same `TVar` twice adds a duplicate entry, which costs one
+//!   extra (harmless) validation and avoids a lookup on every read.
+//! * **Write-set**: a small inline vector of `(id, handle, boxed value)`,
+//!   with at most one entry per `TVar`. It is sorted by id only once, at
+//!   commit, which gives the global lock order. Transactions are usually
+//!   small, so the linear scan for read-your-own-writes is cheaper than a
+//!   map. (The first version used a `HashMap` and a `BTreeMap`; switching to
+//!   inline vectors removed two heap allocations per transaction.)
 //! * **Errors vs. retry**: closures return `Result`. `Err(Conflict)` means
 //!   "this attempt saw an inconsistent state, run me again" and is what
 //!   `?` on [`Transaction::read`] produces. [`try_atomically`] additionally
 //!   lets the closure fail with its own error, which aborts the transaction
 //!   without retrying.
-//! * **Retry**: a plain loop inside `atomically`. A transaction only retries
-//!   because some other transaction committed (or is committing) a write it
-//!   depends on, so the system as a whole always makes progress, but an
-//!   individual transaction can starve under heavy contention. There is
-//!   deliberately no backoff yet — a known gap, noted in `ARCHITECTURE.md`.
+//! * **Retry**: a loop inside `atomically` with bounded exponential backoff
+//!   between attempts (see [`Backoff`]). A transaction only retries because
+//!   some other transaction committed (or is committing) a write it depends
+//!   on, so the system as a whole always makes progress; backoff reduces how
+//!   often colliding transactions keep colliding.
 
+use smallvec::SmallVec;
 use std::any::Any;
-use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::fmt;
-use std::sync::Arc;
 
 use crate::clock;
+use crate::stats::{self, Outcome};
+use crate::sync;
 use crate::tvar::{Cell, TVar};
 
 /// "This attempt hit a conflict; run the transaction again."
@@ -94,32 +99,76 @@ impl<E> From<Conflict> for TxError<E> {
 }
 
 /// A buffered write: the target `TVar` (type-erased) and the value to
-/// install at commit, boxed so one map can hold writes of different types.
-struct WriteEntry {
-    cell: Arc<dyn Cell>,
-    value: Box<dyn Any + Send>,
+/// install at commit, boxed so one set can hold writes of different types.
+struct WriteEntry<'env> {
+    id: u64,
+    cell: &'env dyn Cell,
+    /// Always `Some` until write-back moves the value into the `TVar`.
+    value: Option<Box<dyn Any + Send>>,
 }
+
+/// Inline capacity of the read-set before it spills to the heap.
+const READ_INLINE: usize = 8;
+/// Inline capacity of the write-set before it spills to the heap.
+const WRITE_INLINE: usize = 4;
+
+type ReadSet<'env> = SmallVec<[(u64, &'env dyn Cell); READ_INLINE]>;
+type WriteSet<'env> = SmallVec<[WriteEntry<'env>; WRITE_INLINE]>;
 
 /// The context passed into a transaction's closure body.
 ///
 /// This is what the user's code calls `.read()` and `.write()` on inside
 /// an `atomically` block, instead of touching `TVar`s directly.
-pub struct Transaction {
+///
+/// The lifetime `'env` is how long the `TVar`s it touches are borrowed for.
+/// The read-set and write-set hold plain `&'env` references to them rather
+/// than reference-counted handles, so recording a read or a write costs no
+/// atomic operation, and the compiler guarantees every `TVar` outlives the
+/// transaction that refers to it. For example, this does not compile,
+/// because the `TVar` would be dropped while the read-set still points at it:
+///
+/// ```compile_fail
+/// use stm::{atomically, TVar};
+///
+/// atomically(|tx| {
+///     let temporary = TVar::new(1);
+///     tx.read(&temporary)
+/// });
+/// ```
+///
+/// A helper that takes a transaction and some `TVar`s names the shared
+/// lifetime explicitly:
+///
+/// ```
+/// use stm::{atomically, Conflict, TVar, Transaction};
+///
+/// fn deposit<'env>(tx: &mut Transaction<'env>, account: &'env TVar<i64>, amount: i64)
+///     -> Result<(), Conflict>
+/// {
+///     let balance = tx.read(account)?;
+///     tx.write(account, balance + amount);
+///     Ok(())
+/// }
+///
+/// let account = TVar::new(10);
+/// atomically(|tx| deposit(tx, &account, 5));
+/// assert_eq!(atomically(|tx| tx.read(&account)), 15);
+/// ```
+pub struct Transaction<'env> {
     /// Snapshot of the global clock at the start of this attempt.
     read_version: u64,
-    /// `TVar`s read so far, by id. Order doesn't matter for validation.
-    read_set: HashMap<u64, Arc<dyn Cell>>,
-    /// Buffered writes, by `TVar` id. A `BTreeMap` so that iteration is in
-    /// ascending id order, which is the global lock order for commit.
-    write_set: BTreeMap<u64, WriteEntry>,
+    /// `TVar`s read so far (possibly with duplicates). Order doesn't matter.
+    read_set: ReadSet<'env>,
+    /// Buffered writes, at most one per `TVar`. Sorted by id at commit.
+    write_set: WriteSet<'env>,
 }
 
-impl Transaction {
+impl<'env> Transaction<'env> {
     fn new() -> Self {
         Transaction {
             read_version: clock::read_clock(),
-            read_set: HashMap::new(),
-            write_set: BTreeMap::new(),
+            read_set: SmallVec::new(),
+            write_set: SmallVec::new(),
         }
     }
 
@@ -134,22 +183,22 @@ impl Transaction {
     ///   the transaction is re-run from the start. Aborting here, rather
     ///   than at commit, means the closure never computes with a mix of old
     ///   and new values.
-    pub fn read<T>(&mut self, var: &TVar<T>) -> Result<T, Conflict>
+    pub fn read<T>(&mut self, var: &'env TVar<T>) -> Result<T, Conflict>
     where
         T: Clone + Send + 'static,
     {
-        if let Some(entry) = self.write_set.get(&var.id()) {
+        let id = var.id();
+        if let Some(entry) = self.write_set.iter().find(|e| e.id == id) {
             let pending = entry
                 .value
-                .downcast_ref::<T>()
+                .as_ref()
+                .and_then(|v| v.downcast_ref::<T>())
                 .expect("write-set entry type must match its TVar's type");
             return Ok(pending.clone());
         }
 
         let value = var.read_at(self.read_version).ok_or(Conflict)?;
-        self.read_set
-            .entry(var.id())
-            .or_insert_with(|| var.erased());
+        self.read_set.push((id, var.cell()));
         Ok(value)
     }
 
@@ -158,21 +207,36 @@ impl Transaction {
     /// Nothing is visible to other threads (or applied to `var`) until the
     /// transaction commits. Writing the same `TVar` twice keeps the last
     /// value.
-    pub fn write<T>(&mut self, var: &TVar<T>, value: T)
+    pub fn write<T>(&mut self, var: &'env TVar<T>, value: T)
     where
         T: Send + 'static,
     {
-        self.write_set.insert(
-            var.id(),
-            WriteEntry {
-                cell: var.erased(),
-                value: Box::new(value),
-            },
-        );
+        let id = var.id();
+        let value: Box<dyn Any + Send> = Box::new(value);
+        match self.write_set.iter_mut().find(|e| e.id == id) {
+            Some(entry) => entry.value = Some(value),
+            None => self.write_set.push(WriteEntry {
+                id,
+                cell: var.cell(),
+                value: Some(value),
+            }),
+        }
+    }
+
+    /// Number of entries in the read-set (including duplicates).
+    #[cfg_attr(not(feature = "trace"), allow(dead_code))]
+    fn reads(&self) -> usize {
+        self.read_set.len()
+    }
+
+    /// Number of distinct `TVar`s in the write-set.
+    fn writes(&self) -> usize {
+        self.write_set.len()
     }
 
     /// Try to commit. Returns `true` if the transaction's effects are now
     /// visible, `false` if validation failed and the attempt must be redone.
+    /// Either way the write-set is consumed.
     fn commit(&mut self) -> bool {
         // A read-only transaction has nothing to publish. Each of its reads
         // was already checked against `read_version`, so together they are a
@@ -181,10 +245,12 @@ impl Transaction {
             return true;
         }
 
-        // (a) Lock the write-set in ascending id order. The guard unlocks
-        // everything when dropped, so every early `return false` below
-        // releases the locks.
-        let locks = LockedSet::acquire(self.write_set.values().map(|e| Arc::clone(&e.cell)));
+        // (a) Sort the write-set into the global lock order and lock it. The
+        // guard owns the entries and unlocks them when dropped, so every
+        // early `return false` below releases the locks.
+        let mut entries = std::mem::take(&mut self.write_set);
+        entries.sort_unstable_by_key(|e| e.id);
+        let mut locked = LockedSet::acquire(entries);
 
         // (b) Take the write version. This must come AFTER the locks are
         // held and BEFORE validation; see ARCHITECTURE.md for why.
@@ -195,75 +261,152 @@ impl Transaction {
         // can have invalidated our reads and the checks can be skipped.
         if write_version != self.read_version + 1 {
             for (id, cell) in &self.read_set {
-                let locked_by_us = self.write_set.contains_key(id);
-                if !cell.validate(self.read_version, locked_by_us) {
+                if !cell.validate(self.read_version, locked.contains(*id)) {
                     return false;
                 }
             }
         }
 
         // (d) Write back, stamping every value with the write version, then
-        // release the locks (when `locks` drops).
-        for (_, entry) in std::mem::take(&mut self.write_set) {
-            entry.cell.store(entry.value, write_version);
-        }
-        drop(locks);
+        // release the locks (when `locked` drops).
+        locked.write_back(write_version);
         true
     }
 }
 
-/// RAII guard over a set of locked `TVar`s: unlocks them all on drop, so a
-/// failed validation (or a panic) can never leave a `TVar` locked forever.
-struct LockedSet {
-    cells: Vec<Arc<dyn Cell>>,
+/// RAII guard over a write-set whose `TVar`s are locked: unlocks every
+/// locked entry on drop, so a failed validation (or a panic) can never leave
+/// a `TVar` locked forever.
+struct LockedSet<'env> {
+    entries: WriteSet<'env>,
+    /// How many entries (a prefix of `entries`) are currently locked.
+    locked: usize,
 }
 
-impl LockedSet {
-    /// Lock `cells` in the order given. The caller must supply them in
-    /// strictly ascending id order — that order is what rules out deadlock.
-    fn acquire(cells: impl Iterator<Item = Arc<dyn Cell>>) -> Self {
-        let mut set = LockedSet { cells: Vec::new() };
-        for cell in cells {
+impl<'env> LockedSet<'env> {
+    /// Lock every entry, in order. The entries must be sorted by strictly
+    /// ascending id; that order is what rules out deadlock.
+    fn acquire(entries: WriteSet<'env>) -> Self {
+        let mut set = LockedSet { entries, locked: 0 };
+        for i in 0..set.entries.len() {
             debug_assert!(
-                set.cells.last().is_none_or(|prev| prev.id() < cell.id()),
+                i == 0 || set.entries[i - 1].id < set.entries[i].id,
                 "locks must be taken in strictly ascending id order"
             );
-            cell.lock();
-            set.cells.push(cell);
+            set.entries[i].cell.lock();
+            set.locked = i + 1;
         }
         set
     }
-}
 
-impl Drop for LockedSet {
-    fn drop(&mut self) {
-        for cell in self.cells.iter().rev() {
-            cell.unlock();
+    /// Is the `TVar` with this id one of ours (and therefore locked by us)?
+    fn contains(&self, id: u64) -> bool {
+        self.entries.binary_search_by_key(&id, |e| e.id).is_ok()
+    }
+
+    /// Install every buffered value, stamped with `version`.
+    fn write_back(&mut self, version: u64) {
+        for entry in &mut self.entries {
+            let value = entry.value.take().expect("each value is written once");
+            entry.cell.store(value, version);
         }
     }
 }
 
+impl Drop for LockedSet<'_> {
+    fn drop(&mut self) {
+        for entry in self.entries[..self.locked].iter().rev() {
+            entry.cell.unlock();
+        }
+    }
+}
+
+/// Bounded exponential backoff between retries.
+///
+/// After the k-th consecutive failed attempt, spin for about `2^k` pause
+/// instructions (k capped at [`Backoff::SPIN_LIMIT`]); beyond that, yield
+/// the thread instead. Two transactions that collided once are likely to
+/// collide again if they retry immediately, so waiting a little, and a
+/// little longer each time, lets one of them finish first.
+struct Backoff {
+    step: u32,
+}
+
+impl Backoff {
+    const SPIN_LIMIT: u32 = 6;
+    const YIELD_LIMIT: u32 = 10;
+
+    fn new() -> Self {
+        Backoff { step: 0 }
+    }
+
+    fn snooze(&mut self) {
+        if self.step <= Self::SPIN_LIMIT {
+            for _ in 0..(1u32 << self.step) {
+                sync::spin_loop();
+            }
+        } else {
+            sync::yield_now();
+        }
+        if self.step < Self::YIELD_LIMIT {
+            self.step += 1;
+        }
+    }
+}
+
+/// Log one attempt to stderr when the `trace` feature is on.
+#[cfg(feature = "trace")]
+fn trace(attempt: u32, tx: &Transaction<'_>, writes: usize, outcome: Outcome) {
+    eprintln!(
+        "[stm] {:?} attempt={attempt} rv={} reads={} writes={writes} outcome={outcome:?}",
+        std::thread::current().id(),
+        tx.read_version,
+        tx.reads(),
+    );
+}
+
+#[cfg(not(feature = "trace"))]
+#[inline(always)]
+fn trace(_attempt: u32, _tx: &Transaction<'_>, _writes: usize, _outcome: Outcome) {}
+
 /// The retry loop shared by [`atomically`] and [`try_atomically`].
-fn run<F, T, E>(body: F) -> Result<T, E>
+fn run<'env, F, T, E>(body: F) -> Result<T, E>
 where
-    F: Fn(&mut Transaction) -> Result<T, TxError<E>>,
+    F: Fn(&mut Transaction<'env>) -> Result<T, TxError<E>>,
 {
+    let mut backoff = Backoff::new();
+    let mut attempt = 0u32;
     loop {
+        attempt = attempt.wrapping_add(1);
         let mut tx = Transaction::new();
-        match body(&mut tx) {
+        let outcome = match body(&mut tx) {
             Ok(value) => {
+                let writes = tx.writes();
                 if tx.commit() {
+                    stats::record(Outcome::Committed);
+                    trace(attempt, &tx, writes, Outcome::Committed);
                     return Ok(value);
                 }
                 // Validation failed: `tx` (both sets) is dropped, and we go
-                // around again with a fresh snapshot. No backoff yet.
+                // around again with a fresh snapshot.
+                trace(attempt, &tx, writes, Outcome::ValidationFailed);
+                Outcome::ValidationFailed
             }
-            Err(TxError::Conflict) => {}
+            Err(TxError::Conflict) => {
+                trace(attempt, &tx, tx.writes(), Outcome::ReadConflict);
+                Outcome::ReadConflict
+            }
             // Every read in this attempt was checked against the snapshot,
             // so the closure's failure was decided on consistent data and
             // can be trusted. `tx` is dropped here, discarding its writes.
-            Err(TxError::Failed(error)) => return Err(error),
-        }
+            Err(TxError::Failed(error)) => {
+                stats::record(Outcome::UserAbort);
+                trace(attempt, &tx, tx.writes(), Outcome::UserAbort);
+                return Err(error);
+            }
+        };
+        stats::record(outcome);
+        backoff.snooze();
     }
 }
 
@@ -271,7 +414,7 @@ where
 /// commits successfully.
 ///
 /// This is the only public entry point into the whole library for
-/// ordinary use — everything else (`TVar`, `Transaction`) exists to
+/// ordinary use; everything else (`TVar`, `Transaction`) exists to
 /// support this function.
 ///
 /// `body` may run **more than once** (once per attempt), so it should only
@@ -290,9 +433,9 @@ where
 /// });
 /// assert_eq!(atomically(|tx| tx.read(&balance)), 150);
 /// ```
-pub fn atomically<F, T>(body: F) -> T
+pub fn atomically<'env, F, T>(body: F) -> T
 where
-    F: Fn(&mut Transaction) -> Result<T, Conflict>,
+    F: Fn(&mut Transaction<'env>) -> Result<T, Conflict>,
 {
     match run::<_, T, Infallible>(|tx| body(tx).map_err(|Conflict| TxError::Conflict)) {
         Ok(value) => value,
@@ -321,9 +464,9 @@ where
 /// });
 /// assert_eq!(result, Err("insufficient funds"));
 /// ```
-pub fn try_atomically<F, T, E>(body: F) -> Result<T, E>
+pub fn try_atomically<'env, F, T, E>(body: F) -> Result<T, E>
 where
-    F: Fn(&mut Transaction) -> Result<T, TxError<E>>,
+    F: Fn(&mut Transaction<'env>) -> Result<T, TxError<E>>,
 {
     run(body)
 }
@@ -506,5 +649,72 @@ mod tests {
         }
 
         assert_eq!(get(&counter), THREADS * INCREMENTS);
+    }
+
+    #[test]
+    fn writing_a_tvar_twice_keeps_the_last_value() {
+        let var = TVar::new(0);
+        atomically(|tx| {
+            tx.write(&var, 1);
+            tx.write(&var, 2);
+            Ok(())
+        });
+        assert_eq!(get(&var), 2);
+    }
+
+    #[test]
+    fn large_transactions_spill_past_the_inline_capacity() {
+        // More TVars than the inline read-set and write-set capacity, to
+        // exercise the heap-allocated path and the sort before locking.
+        let vars: Vec<TVar<u32>> = (0..50).map(TVar::new).collect();
+        atomically(|tx| {
+            for var in vars.iter().rev() {
+                let v = tx.read(var)?;
+                tx.write(var, v * 2);
+            }
+            Ok(())
+        });
+        let total: u32 = atomically(|tx| vars.iter().map(|v| tx.read(v)).sum());
+        assert_eq!(total, (0..50).map(|v| v * 2).sum());
+    }
+
+    #[test]
+    fn stats_count_each_outcome() {
+        crate::stats::reset_thread_stats();
+        let var = TVar::new(0);
+
+        // One clean commit.
+        set(&var, 1);
+
+        // One read conflict then a commit: the closure writes `var` from
+        // "another transaction" before reading it on the first attempt.
+        let first = AtomicU32::new(0);
+        atomically(|tx| {
+            if first.fetch_add(1, Ordering::SeqCst) == 0 {
+                set(&var, 5); // counts as its own commit
+            }
+            let v = tx.read(&var)?;
+            tx.write(&var, v + 1);
+            Ok(())
+        });
+
+        // One user abort.
+        let _: Result<(), ()> = try_atomically(|_| Err(TxError::Failed(())));
+
+        let stats = crate::stats::thread_stats();
+        // set(1) + inner set(5) + the retried outer transaction = 3 commits.
+        assert_eq!(stats.commits, 3);
+        assert_eq!(stats.read_conflicts, 1);
+        assert_eq!(stats.validation_failures, 0);
+        assert_eq!(stats.user_aborts, 1);
+    }
+
+    #[test]
+    fn backoff_grows_then_caps() {
+        let mut backoff = Backoff::new();
+        for _ in 0..50 {
+            backoff.snooze();
+        }
+        assert_eq!(backoff.step, Backoff::YIELD_LIMIT);
     }
 }

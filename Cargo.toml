@@ -1,17 +1,37 @@
 [package]
 name = "stm"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
+rust-version = "1.85"
+description = "A software transactional memory library for Rust, built on the TL2 algorithm"
+license = "MIT"
+repository = "https://github.com/KeRon-asm/Software-Transactional-Memory-Library"
+readme = "README.md"
+keywords = ["stm", "concurrency", "transactional-memory", "tl2", "lock-free"]
+categories = ["concurrency"]
+
+[features]
+# Log every transaction attempt (read version, set sizes, outcome) to stderr.
+trace = []
 
 [dependencies]
-crossbeam = "0.8.5"
 parking_lot = "0.12.5"
+smallvec = { version = "1", features = ["union"] }
 
 [dev-dependencies]
 criterion = "0.8.2"
-loom = "0.7.2"
 rand = "0.10.3"
 
 [[bench]]
 name = "transfer_bench"
 harness = false
+
+# loom is only compiled when model checking: RUSTFLAGS="--cfg loom".
+[target.'cfg(loom)'.dependencies]
+loom = "0.7.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[profile.bench]
+debug = true
